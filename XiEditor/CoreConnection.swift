@@ -14,18 +14,58 @@
 
 import Foundation
 
+/// Env var used to specify a path for logging RPC messages.
+/// These logs can be used for profiling & debugging.
+let XI_RPC_LOG = "XI_CLIENT_RPC_LOG"
+
+/// Error tolerant wrapper for append-writing to a file.
+struct FileWriter {
+    let path: URL
+    let handle: FileHandle
+    
+    init?(path: String) {
+        let path = NSString(string: path).expandingTildeInPath
+        if FileManager.default.fileExists(atPath: path) {
+            print("file exists at \(path), will not overwrite")
+            return nil
+        }
+        self.path = URL(fileURLWithPath: path)
+        FileManager.default.createFile(atPath: self.path.path, contents: nil, attributes: nil)
+        
+        do {
+            try self.handle = FileHandle(forWritingTo: self.path)
+        } catch let err as NSError {
+            print("error opening log file \(err)")
+            return nil
+        }
+    }
+
+    func write(bytes: Data) {
+        handle.write(bytes)
+    }
+}
+
 class CoreConnection {
 
     var inHandle: FileHandle  // stdin of core process
     var recvBuf: Data
-    var callback: (AnyObject) -> ()
-
+    var callback: (Any) -> Any?
+    let rpcLogWriter: FileWriter?
+    
     // RPC state
     var queue = DispatchQueue(label: "com.levien.xi.CoreConnection", attributes: [])
     var rpcIndex = 0
     var pending = Dictionary<Int, (Any?) -> ()>()
 
-    init(path: String, callback: @escaping (Any) -> ()) {
+    init(path: String, callback: @escaping (Any) -> Any?) {
+        if let rpcLogPath = ProcessInfo.processInfo.environment[XI_RPC_LOG] {
+            self.rpcLogWriter = FileWriter(path: rpcLogPath)
+            if self.rpcLogWriter != nil {
+                print("logging client RPC to \(rpcLogPath)")
+            }
+        } else {
+            self.rpcLogWriter = nil
+        }
         let task = Process()
         task.launchPath = path
         task.arguments = []
@@ -36,6 +76,7 @@ class CoreConnection {
         inHandle = inPipe.fileHandleForWriting
         recvBuf = Data()
         self.callback = callback
+
         outPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             self.recvHandler(data)
@@ -75,6 +116,7 @@ class CoreConnection {
             mutdata.append(data)
             let nl = [0x0a as UInt8]
             mutdata.append(nl, length: 1)
+            rpcLogWriter?.write(bytes: mutdata as Data)
             inHandle.write(mutdata as Data)
         } catch _ {
             print("error serializing to json")
@@ -84,14 +126,34 @@ class CoreConnection {
     func handleRaw(_ data: Data) {
         do {
             let json = try JSONSerialization.jsonObject(with: data, options: .allowFragments)
-            //print("got \(json)")
-            if !handleRpcResponse(json as AnyObject) {
+//            print("got \(json)")
+            handleRpc(json as Any)
+        } catch {
+            print("json error \(error.localizedDescription)")
+        }
+    }
+
+    /// handle a JSON RPC call. Determines whether it is a request, response or notifcation
+    /// and executes/responds accordingly
+    func handleRpc(_ json: Any) {
+        if let obj = json as? [String: Any], let index = obj["id"] as? Int {
+            if let result = obj["result"] { // is response
+                var callback: ((Any?) -> ())?
+                queue.sync {
+                    callback = self.pending.removeValue(forKey: index)
+                }
+                callback?(result)
+            } else { // is request
                 DispatchQueue.main.async {
-                    self.callback(json as AnyObject)
+                    let result = self.callback(json as AnyObject)
+                    let resp = ["id": index, "result": result] as [String : Any?]
+                    self.sendJson(resp as Any)
                 }
             }
-        } catch _ {
-            print("json error")
+        } else { // is notification
+            DispatchQueue.main.async {
+                let _ = self.callback(json as AnyObject)
+            }
         }
     }
 
@@ -122,19 +184,5 @@ class CoreConnection {
         }
         let _ = semaphore.wait(timeout: DispatchTime.distantFuture)
         return result
-    }
-
-    func handleRpcResponse(_ response: Any) -> Bool {
-        if let resp = response as? [String: Any], let index = resp["id"] as? Int {
-            var callback: ((Any?) -> ())? = nil
-            let result = resp["result"]
-            queue.sync {
-                callback = self.pending.removeValue(forKey: index)
-            }
-            callback?(result)
-            return true;
-        } else {
-            return false;
-        }
     }
 }

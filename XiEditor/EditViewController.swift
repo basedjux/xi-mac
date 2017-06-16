@@ -23,8 +23,14 @@ protocol EditViewDataSource {
     var document: Document! { get }
 }
 
+protocol FindDelegate {
+    func find(_ term: String?, caseSensitive: Bool)
+    func findNext(wrapAround: Bool, allowSame: Bool)
+    func findPrevious(wrapAround: Bool)
+    func closeFind()
+}
 
-class EditViewController: NSViewController, EditViewDataSource {
+class EditViewController: NSViewController, EditViewDataSource, FindDelegate {
 
     
     @IBOutlet var shadowView: ShadowView!
@@ -35,21 +41,42 @@ class EditViewController: NSViewController, EditViewDataSource {
     
     @IBOutlet weak var gutterViewWidth: NSLayoutConstraint!
     @IBOutlet weak var editViewHeight: NSLayoutConstraint!
+
+    lazy var findViewController: FindViewController! = {
+        let storyboard = NSStoryboard(name: "Main", bundle: nil)
+        let controller = storyboard.instantiateController(withIdentifier: "Find View Controller") as! FindViewController
+        controller.findDelegate = self
+        self.view.addSubview(controller.view)
+        controller.view.translatesAutoresizingMaskIntoConstraints = false
+        controller.view.topAnchor.constraint(equalTo: self.view.topAnchor).isActive = true
+        controller.view.leadingAnchor.constraint(equalTo: self.view.leadingAnchor).isActive = true
+        controller.view.trailingAnchor.constraint(equalTo: self.view.trailingAnchor).isActive = true
+        controller.view.isHidden = true
+        return controller
+    }()
     
     var document: Document!
     
     var lines: LineCache = LineCache()
+
+    var textMetrics: TextDrawingMetrics {
+        return (NSApplication.shared().delegate as! AppDelegate).textMetrics
+    }
     var styleMap: StyleMap {
         return (NSApplication.shared().delegate as! AppDelegate).styleMap
     }
 
-    //TODO: preferred font should be a user preference
-    var textMetrics = TextDrawingMetrics(font: CTFontCreateWithName("InconsolataGo" as CFString?, 14, nil))
-    
     var gutterWidth: CGFloat {
         return gutterViewWidth.constant
     }
-    
+
+    /// A mapping of available plugins to activation status.
+    var availablePlugins: [String: Bool] = [:] {
+        didSet {
+            updatePluginMenu()
+        }
+    }
+
     // used to calculate the gutter width. Initial -1 so that a new document
     // still triggers update of gutter width.
     private var lineCount: Int = -1 {
@@ -64,6 +91,9 @@ class EditViewController: NSViewController, EditViewDataSource {
     var firstLine: Int = 0
     var lastLine: Int = 0
 
+    // TODO: should be an option in the user preferences
+    var scrollPastEnd = false
+
     private var lastDragPosition: BufferPosition?
     /// handles autoscrolling when a drag gesture exists the window
     private var dragTimer: Timer?
@@ -74,6 +104,7 @@ class EditViewController: NSViewController, EditViewDataSource {
         editView.dataSource = self
         gutterView.dataSource = self
         scrollView.contentView.documentCursor = NSCursor.iBeam();
+        scrollView.automaticallyAdjustsContentInsets = false
     }
 
     override func viewDidAppear() {
@@ -87,9 +118,7 @@ class EditViewController: NSViewController, EditViewDataSource {
     // this gets called when the user changes the font with the font book, for example
     override func changeFont(_ sender: Any?) {
         if let manager = sender as? NSFontManager {
-            textMetrics = textMetrics.newMetricsForFontChange(fontManager: manager)
-            updateGutterWidth()
-            self.editView.needsDisplay = true
+            (NSApplication.shared().delegate as! AppDelegate).handleFontChange(fontManager: manager)
         } else {
             Swift.print("changeFont: called with nil")
             return
@@ -98,7 +127,8 @@ class EditViewController: NSViewController, EditViewDataSource {
 
     func updateGutterWidth() {
         let gutterColumns = "\(lineCount)".characters.count
-        gutterViewWidth.constant = textMetrics.fontWidth * max(2, CGFloat(gutterColumns)) + 2 * gutterView.xPadding
+        let chWidth = NSString(string: "9").size(withAttributes: textMetrics.attributes).width
+        gutterViewWidth.constant = chWidth * max(2, CGFloat(gutterColumns)) + 2 * gutterView.xPadding
     }
     
     func boundsDidChangeNotification(_ notification: Notification) {
@@ -109,7 +139,7 @@ class EditViewController: NSViewController, EditViewDataSource {
         updateEditViewScroll()
     }
 
-    fileprivate func updateEditViewScroll() {
+    func updateEditViewScroll() {
         let first = Int(floor(scrollView.contentView.bounds.origin.y / textMetrics.linespace))
         let height = Int(ceil((scrollView.contentView.bounds.size.height) / textMetrics.linespace))
         let last = first + height
@@ -120,7 +150,7 @@ class EditViewController: NSViewController, EditViewDataSource {
         }
         shadowView?.updateScroll(scrollView.contentView.bounds, scrollView.documentView!.bounds)
         // if the window is resized, update the editViewHeight so we don't show scrollers unnecessarily
-        self.editViewHeight.constant = max(CGFloat(lines.height) * textMetrics.linespace + 2 * textMetrics.descent, scrollView.bounds.height)
+        updateEditViewHeight()
     }
     
     // MARK: - Core Commands
@@ -133,10 +163,19 @@ class EditViewController: NSViewController, EditViewDataSource {
 
         lines.applyUpdate(update: content)
         self.lineCount = lines.height
-        self.editViewHeight.constant = max(CGFloat(lines.height) * textMetrics.linespace + 2 * textMetrics.descent, scrollView.bounds.height)
+        updateEditViewHeight()
         editView.showBlinkingCursor = editView.isFrontmostView
         editView.needsDisplay = true
         gutterView.needsDisplay = true
+    }
+
+    fileprivate func updateEditViewHeight() {
+        let contentHeight = CGFloat(lines.height) * textMetrics.linespace + 2 * textMetrics.descent
+        self.editViewHeight.constant = max(contentHeight, scrollView.bounds.height)
+        if scrollPastEnd {
+            self.editViewHeight.constant += min(contentHeight, scrollView.bounds.height)
+                - textMetrics.linespace - 2 * textMetrics.descent;
+        }
     }
 
     func scrollTo(_ line: Int, _ col: Int) {
@@ -158,7 +197,15 @@ class EditViewController: NSViewController, EditViewDataSource {
         lastDragPosition = position
         let flags = theEvent.modifierFlags.rawValue >> 16
         let clickCount = theEvent.clickCount
-        document.sendRpcAsync("click", params: [position.line, position.column, flags, clickCount])
+        if theEvent.modifierFlags.contains(NSCommandKeyMask) {
+            // Note: all gestures will be moving to "gesture" rpc but for now, just toggle_sel
+            document.sendRpcAsync("gesture", params: [
+                "line": position.line,
+                "col": position.column,
+                "ty": "toggle_sel"])
+        } else {
+            document.sendRpcAsync("click", params: [position.line, position.column, flags, clickCount])
+        }
         dragTimer = Timer.scheduledTimer(timeInterval: TimeInterval(1.0/60), target: self, selector: #selector(_autoscrollTimerCallback), userInfo: nil, repeats: true)
         dragEvent = theEvent
     }
@@ -273,9 +320,40 @@ class EditViewController: NSViewController, EditViewDataSource {
     @IBAction func debugTestFGSpans(_ sender: AnyObject) {
         document.sendRpcAsync("debug_test_fg_spans", params: [])
     }
+
+    func togglePlugin(_ sender: NSMenuItem) {
+        switch sender.state {
+        case 0: Events.StartPlugin(
+            viewIdentifier: document.coreViewIdentifier!,
+            plugin: sender.title).dispatch(document.dispatcher)
+        case 1:
+            Events.StopPlugin(
+                viewIdentifier: document.coreViewIdentifier!,
+                plugin: sender.title).dispatch(document.dispatcher)
+        default:
+            print("unexpected plugin menu state \(sender.title) \(sender.state)")
+        }
+    }
     
-    @IBAction func debugRunPlugin(_ sender: AnyObject) {
-        document.sendRpcAsync("debug_run_plugin", params: [])
+    public func pluginStarted(_ plugin: String) {
+        self.availablePlugins[plugin] = true
+        print("client: plugin started \(plugin)")
+        updatePluginMenu()
+    }
+    
+    public func pluginStopped(_ plugin: String) {
+        self.availablePlugins[plugin] = false
+        print("client: plugin stopped \(plugin)")
+        updatePluginMenu()
+    }
+
+    func updatePluginMenu() {
+        let pluginsMenu = NSApplication.shared().mainMenu!.item(withTitle: "Debug")!.submenu!.item(withTitle: "Plugin");
+        pluginsMenu!.submenu?.removeAllItems()
+        for (plugin, isRunning) in self.availablePlugins {
+            let item = pluginsMenu!.submenu?.addItem(withTitle: plugin, action: #selector(EditViewController.togglePlugin(_:)), keyEquivalent: "")
+            item?.state = isRunning ? 1 : 0
+        }
     }
     
     @IBAction func gotoLine(_ sender: AnyObject) {
@@ -297,13 +375,24 @@ class EditViewController: NSViewController, EditViewDataSource {
             }
         }
     }
+
+    @IBAction func addPreviousLineToSelection(_ sender: NSMenuItem) {
+        document.sendRpcAsync("add_selection_above", params: [])
+    }
+
+    @IBAction func addNextLineToSelection(_ sender: NSMenuItem) {
+        document.sendRpcAsync("add_selection_below", params: [])
+    }
 }
 
 // we set this in Document.swift when we load a new window or tab.
 //TODO: will have to think about whether this will work with splits
 extension EditViewController: NSWindowDelegate {
     func windowDidBecomeKey(_ notification: Notification) {
-        editView.isFrontmostView = true
+        if editView.isFirstResponder {
+            editView.isFrontmostView = true
+        }
+        updatePluginMenu()
     }
 
     func windowDidResignKey(_ notification: Notification) {
