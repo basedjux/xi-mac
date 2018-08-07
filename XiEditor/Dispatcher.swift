@@ -31,10 +31,10 @@ class Dispatcher {
         return coreConnection.sendRpcAsync(rpc.method, params: rpc.params) as! O
     }
 
-    func dispatchWithCallback<E: Event, O>(_ event: E, callback: @escaping (O) -> ()) {
+    func dispatchWithCallback<E: Event>(_ event: E, callback: @escaping (RpcResult) -> ()) {
         let rpc = event.rpcRepresentation
-        return coreConnection.sendRpcAsync(rpc.method, params: rpc.params) { (result: Any?) in
-            callback(result as! O)
+        return coreConnection.sendRpcAsync(rpc.method, params: rpc.params) { result in
+            callback(result)
         }
     }
 }
@@ -47,6 +47,9 @@ enum EventDispatchMethod {
 }
 
 protocol Event {
+    //NOTE: output is now unused; this file in general should be considered deprecated.
+    // In the future we would like to move to having a 'XiCore protocol', and then implementing that
+    // via CoreConnection or equivalent.
     associatedtype Output
 
     var method: String { get }
@@ -56,7 +59,7 @@ protocol Event {
 
     func dispatch(_ dispatcher: Dispatcher) -> Output
 
-    func dispatchWithCallback(_ dispatcher: Dispatcher, callback: @escaping (Output) -> ())
+    func dispatchWithCallback(_ dispatcher: Dispatcher, callback: @escaping (RpcResult) -> ())
 }
 
 extension Event {
@@ -74,7 +77,7 @@ extension Event {
     }
 
     /// Note: the callback may be called from an arbitrary thread
-    func dispatchWithCallback(_ dispatcher: Dispatcher, callback: @escaping (Output) -> ()) {
+    func dispatchWithCallback(_ dispatcher: Dispatcher, callback: @escaping (RpcResult) -> ()) {
         assert(dispatchMethod == .sync)
         dispatcher.dispatchWithCallback(self, callback: callback)
     }
@@ -150,5 +153,38 @@ enum Events { // namespace
             return ["command": "initial_plugins", "view_id": viewIdentifier] as AnyObject
         }
         let dispatchMethod = EventDispatchMethod.sync
+    }
+
+    struct SetTheme: Event {
+        typealias Output = Void
+        let themeName: String
+
+        let method = "set_theme"
+        var params: AnyObject? {
+            return ["theme_name": themeName] as AnyObject
+        }
+        let dispatchMethod = EventDispatchMethod.async
+    }
+    
+    struct TracingConfig: Event {
+        typealias Output = Void
+        let enabled: Bool
+        let method = "tracing_config"
+        var params: AnyObject? {
+            return ["enabled": enabled] as AnyObject
+        }
+        let dispatchMethod = EventDispatchMethod.async
+    }
+    
+    struct SaveTrace: Event {
+        typealias Output = Void
+        let destination: String
+        let frontendSamples : [[String: AnyObject]]
+
+        let method = "save_trace"
+        var params: AnyObject? {
+            return ["destination": destination, "frontend_samples": frontendSamples] as AnyObject
+        }
+        let dispatchMethod = EventDispatchMethod.async
     }
 }

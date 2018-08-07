@@ -24,22 +24,23 @@ struct Style {
     var underline: Bool
     var italic: Bool
     var weight: Int?
-    var attributes: [String: Any] = [:]
+    var attributes: [NSAttributedStringKey: Any] = [:]
+    var fakeItalic = false
 
     init(font fromFont: NSFont, fgColor: NSColor?, bgColor: NSColor?, underline: Bool, italic: Bool, weight: Int?) {
         if let fgColor = fgColor {
-            attributes[NSForegroundColorAttributeName] = fgColor
+            attributes[NSAttributedStringKey.foregroundColor] = fgColor
         }
 
         if let bgColor = bgColor, bgColor.alphaComponent != 0.0 {
-            attributes[NSBackgroundColorAttributeName] = bgColor
+            attributes[NSAttributedStringKey.backgroundColor] = bgColor
         }
 
         if underline {
-            attributes[NSUnderlineStyleAttributeName] = NSUnderlineStyle.styleSingle.rawValue
+            attributes[NSAttributedStringKey.underlineStyle] = NSUnderlineStyle.styleSingle.rawValue
         }
 
-        let fm = NSFontManager.shared()
+        let fm = NSFontManager.shared
         var font: NSFont?
 
         if italic {
@@ -48,7 +49,8 @@ struct Style {
             if let f = closestMatch(of: fromFont, traits: traits, weight: weight ?? fm.weight(of: fromFont)) {
                 font = f
             } else {
-                attributes[NSObliquenessAttributeName] = 0.2
+                attributes[NSAttributedStringKey.obliqueness] = 0.2
+                fakeItalic = true
             }
         }
 
@@ -57,7 +59,7 @@ struct Style {
         }
 
         if let font = font {
-            attributes[NSFontAttributeName] = font
+            attributes[NSAttributedStringKey.font] = font
         }
 
         self.font = font
@@ -100,23 +102,47 @@ struct StyleSpan {
 }
 
 func utf8_offset_to_utf16(_ s: String, _ ix: Int) -> Int {
-    return s.utf8.index(s.utf8.startIndex, offsetBy: ix).samePosition(in: s.utf16)!._offset
+    return s.utf8.index(s.utf8.startIndex, offsetBy: ix).encodedOffset
 }
 
 /// A store of text styles, indexable by id.
-class StyleMap {
+class StyleMapState: UnfairLock {
     private var font: NSFont
     private var styles: [Style?] = []
 
     init(font: NSFont) {
         self.font = font
+        let selectionStyle = Style(font: font,
+                                   fgColor: (NSApplication.shared.delegate as! AppDelegate).theme.selectionForeground,
+                                   bgColor: nil,
+                                   underline: false,
+                                   italic: false,
+                                   weight: nil)
+        let highlightStyle = Style(font: font,
+                                   fgColor: (NSApplication.shared.delegate as! AppDelegate).theme.findHighlightForeground,
+                                   bgColor: nil,
+                                   underline: false,
+                                   italic: false,
+                                   weight: nil)
+        self.styles.append(selectionStyle)
+        self.styles.append(highlightStyle)
     }
 
     func defStyle(json: [String: AnyObject]) {
         guard let styleID = json["id"] as? Int else { return }
 
-        let fgColor = colorFromArgb(json["fg_color"] as? UInt32 ?? 0xFF000000)
-        let bgColor = colorFromArgb(json["bg_color"] as? UInt32 ?? 0)
+        let fgColor: NSColor
+        var bgColor: NSColor? = nil
+
+        if let fg = json["fg_color"] as? UInt32 {
+            fgColor = colorFromArgb(fg)
+        } else {
+            fgColor = (NSApplication.shared.delegate as! AppDelegate).theme.foreground
+        }
+        if let bg = json["bg_color"] as? UInt32 {
+            bgColor = colorFromArgb(bg)
+        }
+
         let underline = json["underline"] as? Bool ?? false
         let italic = json["italic"] as? Bool ?? false
         var weight = json["weight"] as? Int
@@ -138,19 +164,42 @@ class StyleMap {
         }
     }
 
-    /// applies a given style to the AttributedString
-    private func applyStyle(string: NSMutableAttributedString, id: Int, range: NSRange) {
-        if id >= styles.count { return }
-        guard let style = styles[id] else { return }
-
-        string.addAttributes(style.attributes, range: range)
+    func applyStyle(builder: TextLineBuilder, id: Int, range: NSRange, selColor: ARGBColor?) {
+        if id >= styles.count {
+            print("stylemap can't resolve \(id)")
+            return
+        }
+        if id == 0 || id == 1 {
+            builder.addSelSpan(range: convertRange(range), argb: selColor!)
+        } else {
+            guard let style = styles[id] else { return }
+            if let fgColor = style.fgColor {
+                builder.addFgSpan(range: convertRange(range), argb: colorToArgb(fgColor))
+            }
+            if let font = style.font {
+                builder.addFontSpan(range: convertRange(range), font: font)
+            }
+            if style.fakeItalic {
+                builder.addFakeItalicSpan(range: convertRange(range))
+            }
+            if style.underline {
+                builder.addUnderlineSpan(range: convertRange(range), style: .single)
+            }
+        }
     }
-
-    /// Given style information, applies the appropriate text attributes to the passed NSAttributedString
-    func applyStyles(text: String, string: inout NSMutableAttributedString, styles: [StyleSpan]) {
-        // we handle the 0 (selection) and 1 (search highlight) styles in EditView.drawRect
-        for styleSpan in styles.filter({ $0.style >= N_RESERVED_STYLES }) {
-                applyStyle(string: string, id: styleSpan.style, range: styleSpan.range)
+    
+    func applyStyles(builder: TextLineBuilder, styles: [StyleSpan], selColor: ARGBColor, highlightColor: ARGBColor) {
+        for styleSpan in styles {
+            let color: ARGBColor?
+            switch styleSpan.style {
+            case 0:
+                color = selColor
+            case 1:
+                color = highlightColor
+            default:
+                color = nil
+            }
+            applyStyle(builder: builder, id: styleSpan.style, range: styleSpan.range, selColor: color)
         }
     }
 
@@ -161,18 +210,86 @@ class StyleMap {
                   underline: $0.underline, italic: $0.italic, weight: $0.weight)
         } }
     }
+
+    func measureWidth(id: Int, s: String) -> Double {
+        let builder = TextLineBuilder(s, font: self.font)
+        let range = NSMakeRange(0, s.utf16.count)
+        applyStyle(builder: builder, id: id, range: range, selColor: 0)
+        return builder.measure()
+    }
+
+    func measureWidths(_ args: [[String: AnyObject]]) -> [[Double]] {
+        return args.map({(arg: [String: AnyObject]) -> [Double] in
+            guard let id = arg["id"] as? Int, let strings = arg["strings"] as? [String] else {
+                print("invalid measure_widths request")
+                return []
+            }
+            return strings.map({(s: String) -> Double in measureWidth(id: id, s: s)})
+        })
+    }
+}
+
+/// Safe access to the style map, holding a lock
+class StyleMapLocked {
+    private var inner: StyleMapState
+
+    fileprivate init(_ mutex: StyleMapState) {
+        inner = mutex
+        inner.lock()
+    }
+
+    deinit {
+        inner.unlock()
+    }
+
+    /// Defines a style that can then be referred to by index.
+    func defStyle(json: [String: AnyObject]) {
+        inner.defStyle(json: json)
+    }
+
+    /// Applies the styles to the text line builder.
+    func applyStyles(builder: TextLineBuilder, styles: [StyleSpan], selColor: ARGBColor, highlightColor: ARGBColor) {
+        inner.applyStyles(builder: builder, styles: styles, selColor: selColor, highlightColor: highlightColor)
+    }
+
+    func updateFont(to font: NSFont) {
+        inner.updateFont(to: font)
+    }
+
+    func measureWidths(_ args: [[String: AnyObject]]) -> [[Double]] {
+        return inner.measureWidths(args)
+    }
+}
+
+class StyleMap {
+    private let state: StyleMapState
+
+    init(font: NSFont) {
+        state = StyleMapState(font: font)
+    }
+
+    func locked() -> StyleMapLocked {
+        return StyleMapLocked(state)
+    }
 }
 
 func closestMatch(of font: NSFont, traits: NSFontTraitMask, weight: Int) -> NSFont? {
-    let fm = NSFontManager.shared()
+    let fm = NSFontManager.shared
     var weight = weight
     let fromWeight = fm.weight(of: font)
     let direction = fromWeight > weight ? 1 : -1
-    while weight != fromWeight {
+    while true {
         if let f = fm.font(withFamily: font.familyName ?? font.fontName, traits: traits, weight: weight, size: font.pointSize) {
             return f
+        }
+        if weight == fromWeight || weight + direction == fromWeight {
+            break
         }
         weight += direction
     }
     return nil
+}
+
+func convertRange(_ range: NSRange) -> CountableRange<Int> {
+    return range.location ..< (range.location + range.length)
 }

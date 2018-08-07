@@ -1,10 +1,10 @@
-// Copyright 2016 Google Inc. All rights reserved.
+// Copyright 2018 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+// https://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,51 +13,87 @@
 // limitations under the License.
 
 import Cocoa
-/// A custom view that draws a shadow over the editView when content is clipped.
-/// Note: - if we ever move to layer-based drawing this should be handled by a layer on the EditContainerView
-class ShadowView: NSView {
-    var topOffset: CGFloat = 0.0
-    private var topShadow = false
-    private var leadingShadow = false
-    private var trailingShadow = false
-    
-    override func draw(_ dirtyRect: NSRect) {
-        if topShadow || leadingShadow || trailingShadow {
-            let context = NSGraphicsContext.current()!.cgContext
-            let colors = [CGColor(red: 0, green: 0, blue: 0, alpha: 0.4), CGColor(red: 0, green: 0, blue: 0, alpha: 0.0)]
-            let colorLocations: [CGFloat] = [0, 1]
-            let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray, locations: colorLocations)!
-            if topShadow {
-                context.drawLinearGradient(gradient, start: NSPoint(x: 0, y: topOffset), end: NSPoint(x: 0, y: topOffset+3), options: [])
-            }
-            if leadingShadow {
-                context.drawLinearGradient(gradient, start: NSPoint(x: 0, y: 0), end: NSPoint(x: 3, y: 0), options: [])
-            }
-            if trailingShadow {
-                let x = bounds.size.width
-                context.drawLinearGradient(gradient, start: NSPoint(x: x - 1, y: 0), end: NSPoint(x: x - 4, y: 0), options: [])
+
+class ShadowView: NSView, CALayerDelegate {
+
+    override var wantsUpdateLayer: Bool {
+        return true
+    }
+
+    fileprivate var leftShadow = CAGradientLayer()
+    fileprivate var rightShadow = CAGradientLayer()
+
+    /// The x coordinate of the leftmost edge of the left shadow.
+    /// If there is a gutter, this should equal the gutter's right edge.
+    var leftShadowMinX: CGFloat = 0 {
+        didSet {
+            self.needsDisplay = true
+        }
+    }
+
+    /// If set to true, this view will display a shadow at the left side of the view.
+    var showLeftShadow: Bool = true {
+        didSet {
+            if showLeftShadow != oldValue {
+                updateVisibility()
             }
         }
     }
 
-    override var isFlipped: Bool {
-        return true;
-    }
-    
-    // shadow view shouldn't receive mouse events
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        return nil
-    }
-    
-    func updateScroll(_ contentBounds: NSRect, _ docBounds: NSRect) {
-        let newTop = contentBounds.origin.y != -topOffset
-        let newLead = contentBounds.origin.x != 0
-        let newTrail = NSMaxX(contentBounds) < NSMaxX(docBounds)
-        if newTop != topShadow || newLead != leadingShadow || newTrail != trailingShadow {
-            needsDisplay = true
-            topShadow = newTop
-            leadingShadow = newLead
-            trailingShadow = newTrail
+    /// If set to true, this view will display a shadow at the right side of the view.
+    var showRightShadow: Bool = true {
+        didSet {
+            if showRightShadow != oldValue {
+                updateVisibility()
+            }
         }
+    }
+
+    fileprivate var shadowColor = NSColor.shadowColor
+
+    func updateShadowColor(newColor: NSColor?) {
+        if newColor ?? NSColor.shadowColor != self.shadowColor {
+            self.shadowColor = newColor ?? NSColor.shadowColor
+            self.needsDisplay = true
+        }
+    }
+
+    fileprivate func updateVisibility() {
+        self.isHidden = !(showLeftShadow || showRightShadow)
+        leftShadow.isHidden = !showLeftShadow
+        rightShadow.isHidden = !showRightShadow
+    }
+
+    func setup() {
+        self.layerContentsRedrawPolicy = .onSetNeedsDisplay
+        self.leftShadow.delegate = self
+        self.rightShadow.delegate = self
+        self.layer!.addSublayer(leftShadow)
+        self.layer!.addSublayer(rightShadow)
+
+        updateVisibility()
+    }
+
+    override func updateLayer() {
+        leftShadow.frame = CGRect(x: leftShadowMinX, y: self.bounds.origin.y,
+                                  width: 4, height: self.bounds.height)
+
+        rightShadow.frame = CGRect(x: self.bounds.width - 4, y: self.bounds.origin.y,
+                                   width: 4, height: self.bounds.height)
+
+        leftShadow.colors = [shadowColor.cgColor, NSColor.clear.cgColor]
+        leftShadow.transform = CATransform3DMakeRotation((3 * CGFloat.pi) / 2, 0, 0, 1)
+        leftShadow.opacity = 0.4
+        leftShadow.autoresizingMask = .layerHeightSizable
+
+        rightShadow.colors = [shadowColor.cgColor, NSColor.clear.cgColor]
+        rightShadow.transform = CATransform3DMakeRotation(CGFloat.pi / 2, 0, 0, 1)
+        rightShadow.opacity = 0.4
+        rightShadow.autoresizingMask = [.layerHeightSizable, .layerMinXMargin]
+    }
+
+    // by default hiding and revealing our shadows is animated, which is distracting
+    func action(for layer: CALayer, forKey event: String) -> CAAction? {
+        return NSNull()
     }
 }

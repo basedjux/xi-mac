@@ -17,18 +17,16 @@ import Cocoa
 struct PendingNotification {
     let method: String
     let params: Any
-    let callback: ((Any?) -> ())?
+    let callback: RpcCallback?
 }
 
 class Document: NSDocument {
-    
-    /// used internally to force open to an existing empty document when present.
-    static var _documentForNextOpenCall: Document?
 
     /// used internally to keep track of groups of tabs
     static fileprivate var _nextTabbingIdentifier = 0
 
-    /// returns the next available tab group identifer. When we create a new window, if it is not part of an existing tab group it is assigned a new one.
+    /// returns the next available tab group identifer. When we create a new window,
+    /// if it is not part of an existing tab group it is assigned a new one.
     static private func nextTabbingIdentifier() -> String {
         _nextTabbingIdentifier += 1
         return "tab-group-\(_nextTabbingIdentifier)"
@@ -37,27 +35,15 @@ class Document: NSDocument {
     /// if set, should be used as the tabbingIdentifier of new documents' windows.
     static var preferredTabbingIdentifier: String?
 
+    // minimum size for a new or resized window
+    static var minWinSize = NSSize(width: 240, height: 160)
+
     var dispatcher: Dispatcher!
+    
     /// coreViewIdentifier is the name used to identify this document when communicating with the Core.
     var coreViewIdentifier: ViewIdentifier? {
         didSet {
-            guard let identifier = coreViewIdentifier else { return }
-            // on first set, request initial plugins
-            if oldValue == nil {
-                let req = Events.InitialPlugins(viewIdentifier: identifier)
-                dispatcher.coreConnection.sendRpcAsync(
-                req.method, params: req.params!) { [unowned self] (response) in
-                    DispatchQueue.main.async {
-                        let response = response as! [[String: AnyObject?]]
-                        var available: [String: Bool] = [:]
-                        for item in response {
-                            available[item["name"] as! String] = item["running"] as? Bool
-                        }
-                        self.editViewController!.availablePlugins = available
-                    }
-                }
-            }
-
+            guard coreViewIdentifier != nil else { return }
             // apply initial updates when coreViewIdentifier is set
             for pending in self.pendingNotifications {
                 self.sendRpcAsync(pending.method, params: pending.params, callback: pending.callback)
@@ -74,42 +60,15 @@ class Document: NSDocument {
     var tabbingIdentifier: String
     
 	var pendingNotifications: [PendingNotification] = [];
-    var editViewController: EditViewController?
+    weak var editViewController: EditViewController?
 
-    /// used to keep track of whether we're in the process of reusing an empty window
-    fileprivate var _skipShowingWindow = false
-
-    // called only when creating a _new_ document
-    convenience init(type: String) throws {
-        self.init()
-        self.fileType = type
-        Events.NewView(path: nil).dispatchWithCallback(dispatcher!) { (response) in
-            DispatchQueue.main.async {
-                self.coreViewIdentifier = response
-            }
-        }
-    }
-    
-    // called when opening a document
-    convenience init(contentsOf url: URL, ofType typeName: String) throws {
-        self.init()
-        self.fileURL = url
-        self.fileType = typeName
-        Events.NewView(path: url.path).dispatchWithCallback(dispatcher!) { (response) in
-            DispatchQueue.main.async {
-                self.coreViewIdentifier = response
-            }
-        }
-        try self.read(from: url, ofType: typeName)
-    }
-    
-    // called when NSDocument reopens documents on launch
-    convenience init(for urlOrNil: URL?, withContentsOf contentsURL: URL, ofType typeName: String) throws {
-        try self.init(contentsOf: contentsURL, ofType: typeName)
+    /// Returns `true` if this document contains no data.
+    var isEmpty: Bool {
+        return editViewController?.lines.isEmpty ?? false
     }
     
     override init() {
-        dispatcher = (NSApplication.shared().delegate as? AppDelegate)?.dispatcher
+        dispatcher = (NSApplication.shared.delegate as? AppDelegate)?.dispatcher
         tabbingIdentifier = Document.preferredTabbingIdentifier ?? Document.nextTabbingIdentifier()
         super.init()
         // I'm not 100% sure this is necessary but it can't _hurt_
@@ -117,33 +76,23 @@ class Document: NSDocument {
     }
  
     override func makeWindowControllers() {
+        // save this before instantiating because instantiating overwrites with the default position
+        let newFrame = frameForNewWindow()
         var windowController: NSWindowController!
-        // check to see if we should reuse another document's window
-        if let existing = Document._documentForNextOpenCall {
-            assert(existing.windowControllers.count == 1, "each document should only and always own a single windowController")
-            windowController = existing.windowControllers[0]
-            Document._documentForNextOpenCall = nil
-            // if we're reusing an existing window, we want to noop on the `showWindows()` call we receive from the DocumentController
-            _skipShowingWindow = true
-            tabbingIdentifier = existing.tabbingIdentifier
-        } else {
-            // if we aren't reusing, create a new window as normal:
-            let storyboard = NSStoryboard(name: "Main", bundle: nil)
-            windowController = storyboard.instantiateController(withIdentifier: "Document Window Controller") as! NSWindowController
-            
-            if #available(OSX 10.12, *) {
-                windowController.window?.tabbingIdentifier = tabbingIdentifier
-                // preferredTabbingIdentifier is set when a new document is created with cmd-T. When this is the case, set the window's tabbingMode.
-                if Document.preferredTabbingIdentifier != nil {
-                    windowController.window?.tabbingMode = .preferred
-                }
+        let storyboard = NSStoryboard(name: NSStoryboard.Name(rawValue: "Main"), bundle: nil)
+        windowController = storyboard.instantiateController(
+            withIdentifier: NSStoryboard.SceneIdentifier(rawValue: "Document Window Controller")) as! NSWindowController
+        
+        if #available(OSX 10.12, *) {
+            windowController.window?.tabbingIdentifier = NSWindow.TabbingIdentifier(rawValue: tabbingIdentifier)
+            // preferredTabbingIdentifier is set when a new document is created with cmd-T. When this is the case, set the window's tabbingMode.
+            if Document.preferredTabbingIdentifier != nil {
+                windowController.window?.tabbingMode = .preferred
             }
-            //FIXME: some saner way of positioning new windows. maybe based on current window size, with some checks to not completely obscure an existing window?
-            // also awareness of multiple screens (prefer to open on currently active screen)
-            let screenHeight = windowController.window?.screen?.frame.height ?? 800
-            let windowHeight: CGFloat = 800
-            windowController.window?.setFrame(NSRect(x: 200, y: screenHeight - windowHeight - 200, width: 700, height: 800), display: true)
         }
+        
+        windowController.window?.setFrame(newFrame, display: true)
+        windowController.window?.minSize = Document.minWinSize
 
         self.editViewController = windowController.contentViewController as? EditViewController
         editViewController?.document = self
@@ -151,17 +100,7 @@ class Document: NSDocument {
         self.addWindowController(windowController)
     }
 
-    override func showWindows() {
-        // part of our code to reuse existing windows when opening documents
-        assert(windowControllers.count == 1, "documents should have a single window controller")
-        if !(_skipShowingWindow) {
-            super.showWindows()
-        } else {
-            _skipShowingWindow = false
-        }
-    }
-    
-    override func save(to url: URL, ofType typeName: String, for saveOperation: NSSaveOperationType, completionHandler: @escaping (Error?) -> Void) {
+    override func save(to url: URL, ofType typeName: String, for saveOperation: NSDocument.SaveOperationType, completionHandler: @escaping (Error?) -> Void) {
         self.fileURL = url
         self.save(url.path)
         //TODO: save operations should report success, and we should pass any errors to the completion handler
@@ -171,17 +110,16 @@ class Document: NSDocument {
     // Document.close() can be called multiple times (on window close and application terminate)
     override func close() {
         if let identifier = self.coreViewIdentifier {
-            self.coreViewIdentifier = nil
             Events.CloseView(viewIdentifier: identifier).dispatch(dispatcher!)
-            super.close()
         }
+        super.close()
     }
     
     override var isEntireFileLoaded: Bool {
         return false
     }
     
-    override class func autosavesInPlace() -> Bool {
+    override class var autosavesInPlace: Bool {
         return false
     }
 
@@ -195,25 +133,85 @@ class Document: NSDocument {
     
     /// Send a notification specific to the tab. If the tab name hasn't been set, then the
     /// notification is queued, and sent when the tab name arrives.
-    func sendRpcAsync(_ method: String, params: Any, callback: ((Any?) -> ())? = nil) {
+    func sendRpcAsync(_ method: String, params: Any, callback: RpcCallback? = nil) {
+        Trace.shared.trace(method, .rpc, .begin)
         if let coreViewIdentifier = coreViewIdentifier {
             let inner = ["method": method, "params": params, "view_id": coreViewIdentifier] as [String : Any]
             dispatcher?.coreConnection.sendRpcAsync("edit", params: inner, callback: callback)
         } else {
             pendingNotifications.append(PendingNotification(method: method, params: params, callback: callback))
         }
+        Trace.shared.trace(method, .rpc, .end)
     }
 
     /// Note: this is a blocking call, and will also fail if the tab name hasn't been set yet.
     /// We should try to migrate users to either fully async or callback based approaches.
-    func sendRpc(_ method: String, params: Any) -> Any? {
+    func sendRpc(_ method: String, params: Any) -> RpcResult? {
+        Trace.shared.trace(method, .rpc, .begin)
         let inner = ["method": method as AnyObject, "params": params, "view_id": coreViewIdentifier as AnyObject] as [String : Any]
-        return dispatcher?.coreConnection.sendRpc("edit", params: inner)
+        let result = dispatcher?.coreConnection.sendRpc("edit", params: inner)
+        Trace.shared.trace(method, .rpc, .end)
+        return result
     }
 
-    func update(_ content: [String: AnyObject]) {
-        if let editVC = editViewController {
-            editVC.update(content)
+    /// Send a custom plugin command.
+    func sendPluginRpc(_ method: String, receiver: String, params innerParams: [String: AnyObject]) {
+        var innerParams = innerParams;
+        if innerParams["view"] != nil {
+            innerParams["view"] = coreViewIdentifier! as AnyObject
         }
+
+        let params = ["command": "plugin_rpc",
+                      "view_id": coreViewIdentifier!,
+                      "receiver": receiver,
+                      "rpc": [
+                        "rpc_type": "notification",
+                        "method": method,
+                        "params": innerParams]] as [String: Any]
+
+        dispatcher.coreConnection.sendRpcAsync("plugin", params: params)
+    }
+        
+    func sendWillScroll(first: Int, last: Int) {
+        sendRpcAsync("scroll", params: [first, last])
+    }
+
+    func sendPaste(_ pasteString: String) {
+        sendRpcAsync("paste", params: ["chars": pasteString])
+    }
+
+    func updateAsync(update: [String: AnyObject]) {
+        if let editVC = editViewController {
+            editVC.updateAsync(update: update)
+        }
+    }
+
+    /// Returns the frame to be used for the next new window.
+    ///
+    /// - Note: This is the position of the last active window, offset
+    /// down and to the right by a constant factor.
+    func frameForNewWindow() -> NSRect {
+        let offsetSize: CGFloat = 22
+        let screenBounds = NSScreen.main!.visibleFrame
+        let lastFrame = UserDefaults.standard.string(forKey: USER_DEFAULTS_NEW_WINDOW_FRAME)!
+        var nextFrame = NSOffsetRect(NSRectFromString(lastFrame), offsetSize, -offsetSize)
+
+        if nextFrame.maxX > screenBounds.maxX {
+            nextFrame.origin.x = screenBounds.minX + offsetSize
+        }
+
+        if nextFrame.minY <= 0 {
+            nextFrame.origin.y = screenBounds.maxY - nextFrame.height
+        }
+
+        nextFrame.size.width = max(nextFrame.width, Document.minWinSize.width)
+        // the origin is in the bottom left so a height change changes it too:
+        if nextFrame.size.height < Document.minWinSize.height {
+            let oldHeight = nextFrame.size.height
+            nextFrame.size.height = Document.minWinSize.height
+            nextFrame.origin.y = nextFrame.origin.y - (Document.minWinSize.height - oldHeight)
+        }
+
+        return nextFrame
     }
 }
